@@ -1,2 +1,2 @@
-# Python-Stuff
-Random Python Scripts
+# Python
+Repo for my Python Scripts

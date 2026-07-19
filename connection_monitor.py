@@ -67,12 +67,20 @@ APPRISE_HEARTBEAT_INTERVAL = 24 * 60 * 60  # 24 hours
 # Logging setup
 # ---------------------------------------------------------------------------
 
+import sys
+
+# On Windows, the console often defaults to a legacy codepage (e.g. cp1252)
+# that can't render some characters. Force UTF-8 with a safe fallback so
+# logging never crashes on an unusual character.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("conn_monitor")
@@ -170,7 +178,7 @@ def main() -> None:
             if now_mono - last_console_heartbeat >= CONSOLE_HEARTBEAT_INTERVAL:
                 uptime = datetime.now() - monitor_start
                 log.info(
-                    "\u2713 Monitor alive | status: %s | running: %s | outages: %d | total downtime: %s",
+                    "[OK] Monitor alive | status: %s | running: %s | outages: %d | total downtime: %s",
                     "CONNECTED" if connected else "DISCONNECTED",
                     format_duration(uptime),
                     outage_count,

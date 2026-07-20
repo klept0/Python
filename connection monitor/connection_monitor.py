@@ -2,15 +2,28 @@
 """
 Internet Connection Monitor
 ----------------------------
-Continuously checks internet connectivity. When the connection drops,
-it logs the outage start. When the connection comes back, it logs the
-outage and sends an Apprise notification with the downtime duration.
+Continuously checks internet connectivity and:
+  - Logs each outage (start, end, duration) to a dedicated downtime.log
+  - Sends an Apprise notification when the connection is restored
+  - Detects and notifies on external IP changes (startup, after any
+    reconnect, and periodically while connected)
+  - Prints a console "still alive" heartbeat and sends one daily
+    Apprise heartbeat notification
+  - Guards against false alarms from single dropped checks, and backs
+    off its check rate during long outages
+  - Refuses to run twice at once (single-instance lock)
 
 Setup:
     pip install apprise
+    Create apprise_urls.txt next to this script with your real
+    notification URL(s), one per line (see apprise_urls.txt for the
+    format). Without it, the monitor still runs but sends no notifications.
 
 Run:
     python connection_monitor.py
+
+Test your Apprise config without starting the monitor:
+    python connection_monitor.py --test-notify
 
 For long-term use, run it as a background service (see notes at the
 bottom of this file for systemd / Task Scheduler / nohup options).
@@ -18,6 +31,7 @@ bottom of this file for systemd / Task Scheduler / nohup options).
 
 import os
 import socket
+import sys
 import time
 import json
 import logging
@@ -79,7 +93,10 @@ SINGLE_INSTANCE_LOCK_PORT = 47563
 # Resolution order:
 #   1. apprise_urls.txt next to this script — one URL per line, '#' comments OK
 #   2. APPRISE_URLS environment variable — comma-separated
-#   3. _FALLBACK_APPRISE_URLS below (only used if neither of the above exists)
+#
+# There is no hardcoded fallback — if neither of the above is set up,
+# APPRISE_URLS ends up empty and _check_apprise_urls_configured() will
+# warn loudly at startup that no notifications will be sent.
 #
 # Examples of valid URLs:
 #   Discord:   discord://webhook_id/webhook_token
@@ -89,9 +106,6 @@ SINGLE_INSTANCE_LOCK_PORT = 47563
 #   ntfy:      ntfy://ntfy.sh/your_topic
 # Docs: https://github.com/caronc/apprise#popular-notification-services
 APPRISE_URLS_FILE = "apprise_urls.txt"
-_FALLBACK_APPRISE_URLS = [
-    "ntfy://ntfy.sh/your_topic_here",
-]
 
 
 def _load_apprise_urls() -> list[str]:
@@ -108,7 +122,7 @@ def _load_apprise_urls() -> list[str]:
     if env_urls:
         return [u.strip() for u in env_urls.split(",") if u.strip()]
 
-    return _FALLBACK_APPRISE_URLS
+    return []
 
 
 APPRISE_URLS = _load_apprise_urls()
@@ -144,8 +158,6 @@ IP_STATE_FILE = "last_known_ip.json"
 # Logging setup
 # ---------------------------------------------------------------------------
 
-import sys
-
 # On Windows, the console often defaults to a legacy codepage (e.g. cp1252)
 # that can't render some characters. Force UTF-8 with a safe fallback so
 # logging never crashes on an unusual character.
@@ -174,7 +186,7 @@ _downtime_handler.setFormatter(logging.Formatter("%(message)s"))
 downtime_log.addHandler(_downtime_handler)
 
 
-def acquire_instance_lock() -> "socket.socket | None":
+def acquire_instance_lock() -> socket.socket | None:
     """
     Ensure only one copy of the monitor runs at a time. Binds a local-only
     TCP port; if that fails, another instance already holds it. The OS
@@ -238,9 +250,15 @@ _PLACEHOLDER_MARKERS = ("your_topic_here", "webhook_id", "webhook_token", "user_
 
 
 def _check_apprise_urls_configured() -> None:
-    """Warn at startup if APPRISE_URLS still contains the example placeholder."""
+    """Warn at startup if no Apprise URLs are configured, or if a URL still
+    looks like the unedited placeholder text from the example file."""
     if not APPRISE_URLS:
-        log.warning("APPRISE_URLS is empty — no notifications will be sent.")
+        log.warning(
+            "No Apprise URLs configured — create '%s' next to this script "
+            "(one URL per line) or set the APPRISE_URLS environment variable. "
+            "No notifications will be sent until then.",
+            APPRISE_URLS_FILE,
+        )
         return
     for url in APPRISE_URLS:
         if any(marker in url for marker in _PLACEHOLDER_MARKERS):
@@ -524,6 +542,11 @@ if __name__ == "__main__":
 #   WantedBy=multi-user.target
 #
 # Then: sudo systemctl enable --now conn-monitor
+#
+# Note: apprise_urls.txt, downtime.log, connection_monitor.log, and
+# last_known_ip.json are all read/written using relative paths, so
+# whatever runs this script needs its working directory set to the
+# script's folder (the systemd unit above does this via WorkingDirectory).
 #
 # Linux/Mac (quick and dirty): nohup python3 connection_monitor.py &
 #

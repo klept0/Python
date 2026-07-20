@@ -7,5 +7,3 @@
 # pover://user_key@app_token
 # mailtos://user:app_password@gmail.com
 # ntfy://ntfy.sh/your_real_topic_name
-
-ntfy://ntfy.sh/your_topic_here

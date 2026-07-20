@@ -18,7 +18,10 @@ bottom of this file for systemd / Task Scheduler / nohup options).
 
 import socket
 import time
+import json
 import logging
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 
 import apprise
@@ -62,6 +65,22 @@ CONSOLE_HEARTBEAT_INTERVAL = 15 * 60      # 15 minutes
 # Send an Apprise heartbeat notification at this interval, so you know
 # the monitor itself hasn't silently died or lost power/network.
 APPRISE_HEARTBEAT_INTERVAL = 24 * 60 * 60  # 24 hours
+
+# --- External IP change detection -------------------------------------
+# How often to re-check your external IP while connected (in addition to
+# the check performed on startup and immediately after any reconnect).
+IP_CHECK_INTERVAL = 15 * 60   # 15 minutes
+
+# Services to query for your external IP, tried in order until one works.
+IP_CHECK_SERVICES = [
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+]
+
+# Where the last-known IP is persisted, so a change is still detected
+# even if the script itself restarts (e.g. after a power outage / reboot).
+IP_STATE_FILE = "last_known_ip.json"
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -124,12 +143,84 @@ def send_notification(title: str, body: str) -> None:
         log.error("Apprise failed to deliver the notification.")
 
 
+def get_external_ip() -> str | None:
+    """Query external services for the current public IP. Returns None on failure."""
+    for url in IP_CHECK_SERVICES:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                ip = resp.read().decode().strip()
+                if ip:
+                    return ip
+        except (urllib.error.URLError, OSError, TimeoutError):
+            continue
+    return None
+
+
+def load_last_ip() -> str | None:
+    """Load the last-known external IP from disk, if it exists."""
+    try:
+        with open(IP_STATE_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("ip")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def save_last_ip(ip: str) -> None:
+    """Persist the current external IP to disk."""
+    try:
+        with open(IP_STATE_FILE, "w") as f:
+            json.dump({"ip": ip, "updated": datetime.now().isoformat()}, f)
+    except OSError as e:
+        log.error("Could not save IP state file: %s", e)
+
+
+def check_for_ip_change(last_ip: str | None, context: str = "") -> str | None:
+    """
+    Check the current external IP against the last-known one.
+    Logs and sends an Apprise notification if it changed.
+    Returns the IP that should now be treated as "last known"
+    (the current IP if the check succeeded, otherwise the unchanged last_ip).
+    """
+    current_ip = get_external_ip()
+    if current_ip is None:
+        log.warning("Could not determine external IP (all lookup services failed).")
+        return last_ip
+
+    if last_ip is None:
+        log.info("External IP: %s", current_ip)
+        save_last_ip(current_ip)
+        return current_ip
+
+    if current_ip != last_ip:
+        log.warning("External IP changed: %s -> %s%s", last_ip, current_ip,
+                     f" ({context})" if context else "")
+        send_notification(
+            "External IP Address Changed",
+            f"Previous IP: {last_ip}\n"
+            f"New IP: {current_ip}\n"
+            f"Detected: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            + (f"\nContext: {context}" if context else ""),
+        )
+        save_last_ip(current_ip)
+        return current_ip
+
+    return current_ip
+
+
 def main() -> None:
     log.info("Starting internet connection monitor (interval: %ss)", CHECK_INTERVAL)
 
     connected = is_connected()
     log.info("Initial status: %s", "CONNECTED" if connected else "DISCONNECTED")
     outage_start = None if connected else datetime.now()
+
+    # External IP tracking — load whatever was last seen (survives restarts),
+    # then check it now if we're online.
+    last_ip = load_last_ip()
+    if connected:
+        last_ip = check_for_ip_change(last_ip, context="startup")
+    last_ip_check = time.monotonic()
 
     # Heartbeat / stats tracking
     monitor_start = datetime.now()
@@ -171,6 +262,11 @@ def main() -> None:
                 total_downtime += duration
                 outage_start = None
 
+                # IP can change while offline (DHCP re-lease, ISP hiccup,
+                # router reboot, power outage) — check right away.
+                last_ip = check_for_ip_change(last_ip, context="after reconnect")
+                last_ip_check = time.monotonic()
+
             connected = now_connected
 
             # --- Console "still alive" heartbeat -----------------------
@@ -198,6 +294,11 @@ def main() -> None:
                 log.info("Sending daily heartbeat notification.")
                 send_notification("Connection Monitor Heartbeat", heartbeat_msg)
                 last_apprise_heartbeat = now_mono
+
+            # --- Periodic external IP check ------------------------------
+            if connected and (now_mono - last_ip_check >= IP_CHECK_INTERVAL):
+                last_ip = check_for_ip_change(last_ip, context="routine check")
+                last_ip_check = now_mono
 
     except KeyboardInterrupt:
         log.info("Monitor stopped by user.")

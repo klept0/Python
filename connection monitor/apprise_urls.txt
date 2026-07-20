@@ -1,0 +1,11 @@
+# One Apprise notification URL per line. Lines starting with # are ignored.
+# Add as many as you want — all of them get notified.
+#
+# Examples (uncomment and fill in the real values, delete the rest):
+# discord://webhook_id/webhook_token
+# tgram://bot_token/chat_id
+# pover://user_key@app_token
+# mailtos://user:app_password@gmail.com
+# ntfy://ntfy.sh/your_real_topic_name
+
+ntfy://ntfy.sh/your_topic_here

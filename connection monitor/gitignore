@@ -1,0 +1,8 @@
+# Contains real Apprise URLs — often includes API tokens/passwords
+apprise_urls.txt
+
+# Generated at runtime, not meant to be tracked
+connection_monitor.log
+connection_monitor.log.*
+downtime.log
+last_known_ip.json

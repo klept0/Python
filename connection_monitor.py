@@ -20,8 +20,11 @@ import socket
 import time
 import json
 import logging
+import signal
+import argparse
 import urllib.request
 import urllib.error
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
 
 import apprise
@@ -30,8 +33,21 @@ import apprise
 # Configuration — edit these to fit your setup
 # ---------------------------------------------------------------------------
 
-CHECK_INTERVAL = 5          # seconds between connectivity checks
+CHECK_INTERVAL = 5          # seconds between connectivity checks (normal)
 SOCKET_TIMEOUT = 3          # seconds to wait for a connection attempt
+
+# How many CONSECUTIVE failed checks are required before an outage is
+# declared. Guards against a single blip (busy DNS server, one dropped
+# packet) triggering a false "down" -> "restored" notification pair.
+# A single successful check always ends an outage immediately.
+FAILURE_THRESHOLD = 2
+
+# Once an outage has lasted this long, slow the check interval down to
+# OUTAGE_CHECK_INTERVAL. No point hammering the network every 5s during
+# a multi-hour ISP outage; this resets back to CHECK_INTERVAL as soon as
+# the connection returns.
+BACKOFF_AFTER_SECONDS = 60
+OUTAGE_CHECK_INTERVAL = 30
 
 # Hosts used to test connectivity. Any one succeeding counts as "online".
 # Using multiple hosts avoids false positives if one provider has a hiccup.
@@ -42,6 +58,17 @@ PING_HOSTS = [
 ]
 
 LOG_FILE = "connection_monitor.log"
+LOG_RETENTION_DAYS = 7      # how many rotated daily log files to keep
+
+# A separate log containing ONLY completed downtime events (one line per
+# outage: start, end, duration) — nothing else gets written here. This
+# one isn't rotated; it's small and worth keeping as a permanent record.
+DOWNTIME_LOG_FILE = "downtime.log"
+
+# Only one instance of the monitor should run at a time (e.g. avoids
+# duplicate notifications if it's launched both at login and manually).
+# Enforced by binding to this local-only port; harmless, never exposed.
+SINGLE_INSTANCE_LOCK_PORT = 47563
 
 # Apprise notification URL(s) — add one or more.
 # Examples:
@@ -98,11 +125,58 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        TimedRotatingFileHandler(
+            LOG_FILE, when="midnight", backupCount=LOG_RETENTION_DAYS, encoding="utf-8"
+        ),
         logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("conn_monitor")
+
+# Dedicated downtime-only logger — separate file, separate handler, and
+# propagate=False so these lines never also land in the main log/console.
+downtime_log = logging.getLogger("conn_monitor.downtime")
+downtime_log.setLevel(logging.INFO)
+downtime_log.propagate = False
+_downtime_handler = logging.FileHandler(DOWNTIME_LOG_FILE, encoding="utf-8")
+_downtime_handler.setFormatter(logging.Formatter("%(message)s"))
+downtime_log.addHandler(_downtime_handler)
+
+
+def acquire_instance_lock() -> "socket.socket | None":
+    """
+    Ensure only one copy of the monitor runs at a time. Binds a local-only
+    TCP port; if that fails, another instance already holds it. The OS
+    releases the port automatically when this process exits (even on a
+    crash), so there's no stale lock file to clean up.
+    """
+    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        lock_socket.bind(("127.0.0.1", SINGLE_INSTANCE_LOCK_PORT))
+        lock_socket.listen(1)
+        return lock_socket
+    except OSError:
+        lock_socket.close()
+        return None
+
+
+class ShutdownSignal(Exception):
+    """Raised when the process receives a termination signal (e.g. SIGTERM)."""
+
+
+def _handle_termination_signal(signum, frame):
+    raise ShutdownSignal(signal.Signals(signum).name)
+
+
+def _install_signal_handlers() -> None:
+    # SIGTERM: sent by systemd on `stop`, Docker, `kill <pid>`, etc.
+    # Windows doesn't reliably deliver this on Task Scheduler kills, but
+    # it's harmless to register and does work for e.g. WSL/Linux setups.
+    try:
+        signal.signal(signal.SIGTERM, _handle_termination_signal)
+    except (AttributeError, ValueError):
+        pass
 
 
 def is_connected() -> bool:
@@ -129,18 +203,53 @@ def format_duration(delta: timedelta) -> str:
     return " ".join(parts)
 
 
+_PLACEHOLDER_MARKERS = ("your_topic_here", "webhook_id", "webhook_token", "user_key@app_token")
+
+
+def _check_apprise_urls_configured() -> None:
+    """Warn at startup if APPRISE_URLS still contains the example placeholder."""
+    if not APPRISE_URLS:
+        log.warning("APPRISE_URLS is empty — no notifications will be sent.")
+        return
+    for url in APPRISE_URLS:
+        if any(marker in url for marker in _PLACEHOLDER_MARKERS):
+            log.warning(
+                "APPRISE_URLS still contains a placeholder value (%s) — "
+                "replace it with your real notification URL or nothing will be delivered.",
+                url,
+            )
+
+
 def send_notification(title: str, body: str) -> None:
     apobj = apprise.Apprise()
-    for url in APPRISE_URLS:
-        apobj.add(url)
 
-    if len(apobj) == 0:
+    added_any = False
+    for url in APPRISE_URLS:
+        added = apobj.add(url)
+        if not added:
+            log.error("Apprise rejected this URL (bad format?): %s", url)
+        else:
+            added_any = True
+
+    if not added_any:
         log.warning("No valid Apprise URLs configured — skipping notification.")
         return
 
-    ok = apobj.notify(title=title, body=body)
-    if not ok:
-        log.error("Apprise failed to deliver the notification.")
+    try:
+        ok = apobj.notify(title=title, body=body)
+    except Exception:
+        log.exception("Apprise raised an exception while sending notification '%s'", title)
+        return
+
+    if ok:
+        log.info("Notification sent: %s", title)
+    else:
+        log.error(
+            "Apprise reported failure delivering '%s' — check the URL, "
+            "network access to the notification service, and any API "
+            "keys/tokens involved.",
+            title,
+        )
 
 
 def get_external_ip() -> str | None:
@@ -209,11 +318,29 @@ def check_for_ip_change(last_ip: str | None, context: str = "") -> str | None:
 
 
 def main() -> None:
+    lock = acquire_instance_lock()
+    if lock is None:
+        log.error(
+            "Another instance of the monitor appears to already be running "
+            "(port %d is in use) — exiting.",
+            SINGLE_INSTANCE_LOCK_PORT,
+        )
+        return
+    _install_signal_handlers()
+
     log.info("Starting internet connection monitor (interval: %ss)", CHECK_INTERVAL)
+    _check_apprise_urls_configured()
 
     connected = is_connected()
     log.info("Initial status: %s", "CONNECTED" if connected else "DISCONNECTED")
     outage_start = None if connected else datetime.now()
+    consecutive_failures = 0
+
+    send_notification(
+        "Connection Monitor Started",
+        f"Monitor started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+        f"Initial status: {'CONNECTED' if connected else 'DISCONNECTED'}",
+    )
 
     # External IP tracking — load whatever was last seen (survives restarts),
     # then check it now if we're online.
@@ -231,24 +358,37 @@ def main() -> None:
 
     try:
         while True:
-            time.sleep(CHECK_INTERVAL)
-            now_connected = is_connected()
+            # Back off the check rate during a long-confirmed outage —
+            # no need to hammer the network every 5s for hours on end.
+            sleep_for = CHECK_INTERVAL
+            if not connected and outage_start is not None:
+                if (datetime.now() - outage_start).total_seconds() >= BACKOFF_AFTER_SECONDS:
+                    sleep_for = OUTAGE_CHECK_INTERVAL
+            time.sleep(sleep_for)
 
-            if connected and not now_connected:
-                # Connection just dropped
+            raw_connected = is_connected()
+            if raw_connected:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            if connected and consecutive_failures >= FAILURE_THRESHOLD:
+                # Confirmed down (not just a single blip)
                 outage_start = datetime.now()
                 log.warning(
-                    "Connection LOST at %s",
+                    "Connection LOST at %s (after %d consecutive failed checks)",
                     outage_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    consecutive_failures,
                 )
                 if NOTIFY_ON_DROP:
                     send_notification(
                         "Internet Connection Lost",
                         f"Connection dropped at {outage_start.strftime('%Y-%m-%d %H:%M:%S')}",
                     )
+                connected = False
 
-            elif not connected and now_connected:
-                # Connection just came back
+            elif not connected and raw_connected:
+                # A single successful check is enough to confirm restoration
                 outage_end = datetime.now()
                 duration = outage_end - outage_start
                 msg = (
@@ -257,17 +397,22 @@ def main() -> None:
                     f"Total downtime: {format_duration(duration)}"
                 )
                 log.info(msg.replace("\n", " | "))
+                downtime_log.info(
+                    "Down: %s  ->  %s  |  Duration: %s",
+                    outage_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    outage_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    format_duration(duration),
+                )
                 send_notification("Internet Connection Restored", msg)
                 outage_count += 1
                 total_downtime += duration
                 outage_start = None
+                connected = True
 
                 # IP can change while offline (DHCP re-lease, ISP hiccup,
                 # router reboot, power outage) — check right away.
                 last_ip = check_for_ip_change(last_ip, context="after reconnect")
                 last_ip_check = time.monotonic()
-
-            connected = now_connected
 
             # --- Console "still alive" heartbeat -----------------------
             now_mono = time.monotonic()
@@ -301,11 +446,34 @@ def main() -> None:
                 last_ip_check = now_mono
 
     except KeyboardInterrupt:
-        log.info("Monitor stopped by user.")
+        log.info("Monitor stopped by user (Ctrl+C).")
+    except ShutdownSignal as e:
+        log.info("Monitor stopped by system signal (%s).", e)
+    finally:
+        lock.close()
+        log.info("Monitor exiting.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Internet connection monitor with Apprise notifications.")
+    parser.add_argument(
+        "--test-notify",
+        action="store_true",
+        help="Send a single test Apprise notification using APPRISE_URLS, then exit "
+             "(does not start the monitor or require the instance lock).",
+    )
+    args = parser.parse_args()
+
+    if args.test_notify:
+        log.info("Running notification test...")
+        _check_apprise_urls_configured()
+        send_notification(
+            "Connection Monitor Test",
+            f"This is a test notification sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. "
+            f"If you received this, Apprise is configured correctly.",
+        )
+    else:
+        main()
 
 # ---------------------------------------------------------------------------
 # Running this persistently
